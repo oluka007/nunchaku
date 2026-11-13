@@ -25,7 +25,7 @@ Check out `DeepCompressor <github_deepcompressor_>`_ for the quantization librar
     usage/qencoder.rst
     usage/offload.rst
     usage/attention.rst
-    usage/fbcache.rst
+    usage/cache.rst
     usage/pulid.rst
     usage/ip_adapter.rst
     usage/zimage.rst
@@ -42,8 +42,8 @@ Check out `DeepCompressor <github_deepcompressor_>`_ for the quantization librar
     :titlesonly:
 
     ComfyUI Plugin: ComfyUI-nunchaku <https://nunchaku.tech/docs/ComfyUI-nunchaku/>
-    Custom Model Quantization: DeepCompressor <https://github.com/nunchaku-tech/deepcompressor>
-    Gradio Demos <https://github.com/nunchaku-tech/nunchaku/tree/main/app>
+    Custom Model Quantization: DeepCompressor <https://github.com/nunchux-ai/deepcompressor>
+    Gradio Demos <https://github.com/nunchux-ai/nunchaku/tree/main/app>
 
 
 .. toctree::

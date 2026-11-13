@@ -10,6 +10,7 @@ on:
       - "scripts/**"
       - ".github/workflows/pr-test.yaml"
       - "!nunchaku/__version__.py"
+      - ".pyproject.toml"
   workflow_dispatch:
     inputs:
       ref:
@@ -57,7 +58,8 @@ jobs:
           conda install -c conda-forge gxx=11 gcc=11 libsndfile -y
           pip install uv
           uv pip install torch==2.8 torchvision==0.23 --index-url https://download.pytorch.org/whl/cu128
-          uv pip install -e ".[ci]"
+          uv pip install ninja setuptools Cython
+          uv pip install -e ".[ci]" --no-build-isolation
       - name: Setup ComfyUI
         run: |
           source $(conda info --base)/etc/profile.d/conda.sh
@@ -65,7 +67,7 @@ jobs:
           which python
           cd ..
           rm -rf ComfyUI-nunchaku
-          git clone -b dev https://github.com/mit-han-lab/ComfyUI-nunchaku.git
+          git clone -b dev https://github.com/nunchux-ai/ComfyUI-nunchaku.git
           cd ComfyUI-nunchaku
           uv pip install --torch-backend=auto -e ".[ci]"
           cd ..

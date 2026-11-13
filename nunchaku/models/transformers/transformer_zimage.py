@@ -8,20 +8,120 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torch.nn as nn
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
+from diffusers.models.normalization import RMSNorm
 from diffusers.models.transformers.transformer_z_image import FeedForward as ZImageFeedForward
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel, ZImageTransformerBlock
 from huggingface_hub import utils
 
 from nunchaku.models.unets.unet_sdxl import NunchakuSDXLFeedForward
 
-from ...utils import get_precision
+from ...ops.gemm import svdq_gemm_w4a4_cuda
+from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from ...utils import get_precision, pad_tensor
 from ..attention import NunchakuBaseAttention
 from ..attention_processors.zimage import NunchakuZSingleStreamAttnProcessor
+from ..embeddings import pack_rotemb
 from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
-from .utils import NunchakuModelLoaderMixin, patch_scale_key
+from .utils import NunchakuModelLoaderMixin, convert_fp16, patch_scale_key
+
+
+class NunchakuZImageRopeHook:
+    """
+    Hook class for caching and substition of packed `freqs_cis` tensor.
+    """
+
+    def __init__(self):
+        self.packed_cache = {}
+
+    def __call__(self, module: nn.Module, input_args: tuple, input_kwargs: dict):
+        freqs_cis: torch.Tensor = input_kwargs.get("freqs_cis", None)
+        if freqs_cis is None:
+            return None
+        cache_key = freqs_cis.data_ptr()
+        packed_freqs_cis = self.packed_cache.get(cache_key, None)
+        if packed_freqs_cis is None:
+            packed_freqs_cis = torch.view_as_real(freqs_cis).unsqueeze(3)
+            packed_freqs_cis = torch.flip(packed_freqs_cis, dims=[-1])
+            packed_freqs_cis = pack_rotemb(pad_tensor(packed_freqs_cis, 256, 1))
+            self.packed_cache[cache_key] = packed_freqs_cis
+        new_input_kwargs = input_kwargs.copy()
+        new_input_kwargs["freqs_cis"] = packed_freqs_cis
+        return input_args, new_input_kwargs
+
+
+class NunchakuZImageFusedModule(nn.Module):
+    """
+    Fused module for quantized QKV projection, RMS normalization, and rotary embedding for ZImage attention.
+
+    Parameters
+    ----------
+    qkv : SVDQW4A4Linear
+        Quantized QKV projection layer.
+    norm_q : RMSNorm
+        RMSNorm for query.
+    norm_k : RMSNorm
+        RMSNorm for key.
+    """
+
+    def __init__(self, qkv: SVDQW4A4Linear, norm_q: RMSNorm, norm_k: RMSNorm):
+        super().__init__()
+        for name, param in qkv.named_parameters(prefix="qkv_"):
+            setattr(self, name.replace(".", ""), param)
+        self.qkv_precision = qkv.precision
+        self.qkv_out_features = qkv.out_features
+        for name, param in norm_q.named_parameters(prefix="norm_q_"):
+            setattr(self, name.replace(".", ""), param)
+        for name, param in norm_k.named_parameters(prefix="norm_k_"):
+            setattr(self, name.replace(".", ""), param)
+
+    def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor] = None):
+        """
+        Fuse QKV projection, RMS normalizaion and rotary embedding.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            The hidden states tensor
+        freqs_cis : torch.Tensor, optional
+            The rotary embedding tensor
+
+        Returns
+        -------
+        The projection results of q, k, v. q result and k result are RMS-normalized and applied RoPE.
+        """
+        batch_size, seq_len, channels = x.shape
+        x = x.view(batch_size * seq_len, channels)
+        quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
+            x,
+            lora_down=self.qkv_proj_down,
+            smooth=self.qkv_smooth_factor,
+            fp4=self.qkv_precision == "nvfp4",
+            pad_size=256,
+        )
+        output = torch.empty(batch_size * seq_len, self.qkv_out_features, dtype=x.dtype, device=x.device)
+        svdq_gemm_w4a4_cuda(
+            act=quantized_x,
+            wgt=self.qkv_qweight,
+            out=output,
+            ascales=ascales,
+            wscales=self.qkv_wscales,
+            lora_act_in=lora_act_out,
+            lora_up=self.qkv_proj_up,
+            bias=getattr(self, "qkv_bias", None),
+            fp4=self.qkv_precision == "nvfp4",
+            alpha=1.0 if self.qkv_precision == "nvfp4" else None,
+            wcscales=self.qkv_wcscales if self.qkv_precision == "nvfp4" else None,
+            norm_q=self.norm_q_weight,
+            norm_k=self.norm_k_weight,
+            rotary_emb=freqs_cis,
+        )
+
+        output = output.view(batch_size, seq_len, -1)
+        return output
 
 
 class NunchakuZImageAttention(NunchakuBaseAttention):
@@ -146,6 +246,14 @@ def _convert_z_image_ff(z_ff: ZImageFeedForward) -> FeedForward:
     return converted_ff
 
 
+def replace_fused_module(module, incompatible_keys):
+    assert isinstance(module, NunchakuZImageAttention)
+    module.fused_module = NunchakuZImageFusedModule(module.to_qkv, module.norm_q, module.norm_k)
+    del module.to_qkv
+    del module.norm_q
+    del module.norm_k
+
+
 class NunchakuZImageFeedForward(NunchakuSDXLFeedForward):
     """
     Quantized feed-forward block for :class:`NunchakuZImageTransformerBlock`.
@@ -192,12 +300,14 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         def _patch_transformer_block(block_list: List[ZImageTransformerBlock]):
             for _, block in enumerate(block_list):
                 block.attention = NunchakuZImageAttention(block.attention, **kwargs)
+                block.attention.register_load_state_dict_post_hook(replace_fused_module)
                 block.feed_forward = NunchakuZImageFeedForward(block.feed_forward, **kwargs)
 
         def _convert_feed_forward(block_list: List[ZImageTransformerBlock]):
             for _, block in enumerate(block_list):
                 block.feed_forward = _convert_z_image_ff(block.feed_forward)
 
+        self.skip_refiners = skip_refiners
         _patch_transformer_block(self.layers)
         if skip_refiners:
             _convert_feed_forward(self.noise_refiner)
@@ -206,6 +316,43 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
             _patch_transformer_block(self.noise_refiner)
             _patch_transformer_block(self.context_refiner)
         return self
+
+    def register_rope_hook(self, rope_hook: NunchakuZImageRopeHook):
+        self.rope_hook_handles = []
+        for _, ly in enumerate(self.layers):
+            self.rope_hook_handles.append(ly.attention.register_forward_pre_hook(rope_hook, with_kwargs=True))
+        if not self.skip_refiners:
+            for _, nr in enumerate(self.noise_refiner):
+                self.rope_hook_handles.append(nr.attention.register_forward_pre_hook(rope_hook, with_kwargs=True))
+            for _, cr in enumerate(self.context_refiner):
+                self.rope_hook_handles.append(cr.attention.register_forward_pre_hook(rope_hook, with_kwargs=True))
+
+    def unregister_rope_hook(self):
+        for h in self.rope_hook_handles:
+            h.remove()
+        self.rope_hook_handles.clear()
+
+    def forward(
+        self,
+        x: List[torch.Tensor],
+        t,
+        cap_feats: List[torch.Tensor],
+        patch_size=2,
+        f_patch_size=1,
+        return_dict: bool = True,
+    ):
+        """
+        Adapted from diffusers.models.transformers.transformer_z_image.ZImageTransformer2DModel#forward
+
+        Register pre-forward hooks for caching and substitution of packed `freqs_cis` tensor for all attention submodules and unregister after forwarding is done.
+        """
+        rope_hook = NunchakuZImageRopeHook()
+        self.register_rope_hook(rope_hook)
+        try:
+            return super().forward(x, t, cap_feats, patch_size, f_patch_size, return_dict)
+        finally:
+            self.unregister_rope_hook()
+            del rope_hook
 
     @classmethod
     @utils.validate_hf_hub_args
@@ -259,10 +406,12 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
 
         print(f"quantization_config: {quantization_config}, rank={rank}, skip_refiners={skip_refiners}")
 
-        transformer._patch_model(skip_refiners=skip_refiners, precision=precision, rank=rank)
+        transformer._patch_model(skip_refiners=skip_refiners, precision=precision, rank=rank, **kwargs)
         transformer = transformer.to_empty(device=device)
 
         patch_scale_key(transformer, model_state_dict)
+        if torch_dtype == torch.float16:
+            convert_fp16(transformer, model_state_dict)
 
         transformer.load_state_dict(model_state_dict)
 

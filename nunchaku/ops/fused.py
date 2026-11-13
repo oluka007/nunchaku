@@ -3,6 +3,7 @@ High-performance fused operators for quantized neural network inference.
 """
 
 import torch
+from diffusers.models.normalization import RMSNorm as DiffUsersRMSNorm
 from torch.nn import RMSNorm
 
 from nunchaku.models.linear import SVDQW4A4Linear
@@ -41,7 +42,7 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
       - S: sequence length
       - C_in: input features
       - C_out: output features
-    - For INT4 quantization, GELU activations are shifted by 0.171875 to ensure non-negativity, enabling unsigned quantization for improved quality. See: https://github.com/nunchaku-tech/nunchaku/blob/433f0b228a61a53fb700ac676fd2e290368ac94d/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh#L286
+    - For INT4 quantization, GELU activations are shifted by 0.171875 to ensure non-negativity, enabling unsigned quantization for improved quality. See: https://github.com/nunchux-ai/nunchaku/blob/433f0b228a61a53fb700ac676fd2e290368ac94d/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh#L286
     """
     batch_size, seq_len, channels = x.shape
     x = x.view(batch_size * seq_len, channels)
@@ -124,8 +125,12 @@ def fused_qkv_norm_rottary(
     - C_in: input features
     - C_out: output features
     """
-    assert norm_q is None or isinstance(norm_q, RMSNorm)
-    assert norm_k is None or isinstance(norm_k, RMSNorm)
+    assert (
+        norm_q is None or isinstance(norm_q, RMSNorm) or (isinstance(norm_q, DiffUsersRMSNorm) and norm_q.bias is None)
+    )
+    assert (
+        norm_k is None or isinstance(norm_k, RMSNorm) or (isinstance(norm_k, DiffUsersRMSNorm) and norm_k.bias is None)
+    )
 
     batch_size, seq_len, channels = x.shape
     x = x.view(batch_size * seq_len, channels)

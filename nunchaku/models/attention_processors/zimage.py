@@ -31,31 +31,12 @@ class NunchakuZSingleStreamAttnProcessor(ZSingleStreamAttnProcessor):
         """
         Forward pass of the attention module. Adapted from diffusers.models.transformers.transformer_z_image.ZSingleStreamAttnProcessor#__call__.
         """
+        qkv = attn.fused_module(hidden_states, freqs_cis)
 
-        qkv = attn.to_qkv(hidden_states)
         query, key, value = qkv.chunk(3, dim=-1)
-
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
         value = value.unflatten(-1, (attn.heads, -1))
-
-        # Apply Norms
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        # Apply RoPE
-        def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            with torch.amp.autocast("cuda", enabled=False):
-                x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-                freqs_cis = freqs_cis.unsqueeze(2)
-                x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-                return x_out.type_as(x_in)  # todo
-
-        if freqs_cis is not None:
-            query = apply_rotary_emb(query, freqs_cis)
-            key = apply_rotary_emb(key, freqs_cis)
 
         # Cast to correct dtype
         dtype = query.dtype
